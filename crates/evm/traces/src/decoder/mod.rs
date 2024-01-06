@@ -252,78 +252,102 @@ impl CallTraceDecoder {
 
     /// Decodes all nodes in the specified call trace.
     pub async fn decode(&self, traces: &mut CallTraceArena) {
-        for node in &mut traces.arena {
-            self.decode_function(&mut node.trace).await;
-            for log in node.logs.iter_mut() {
-                self.decode_event(log).await;
-            }
-        }
+        self.decode_functions(traces).await;
+        self.decode_events(traces).await;
     }
 
-    async fn decode_function(&self, trace: &mut CallTrace) {
-        let span = trace_span!("decode_function", label = field::Empty).entered();
+    async fn decode_functions(&self, traces: &mut CallTraceArena) {
+        // Step 1: Collect selectors that need decoding.
+        // values = positions in `traces.arena` for nodes requiring that selector.
+        let mut selectors: HashMap<Selector, Vec<usize>> = HashMap::new();
 
-        // Decode precompile
-        if precompiles::decode(trace, 1) {
-            return;
-        }
+        for (node_idx, node) in traces.arena.iter_mut().enumerate() {
+            let trace = &mut node.trace;
 
-        // Set label
-        if trace.label.is_none() {
-            if let Some(label) = self.labels.get(&trace.address) {
-                span.record("label", label);
-                trace.label = Some(label.clone());
+            let span = trace_span!("decode_function", label = field::Empty).entered();
+
+            // Decode precompile
+            if precompiles::decode(trace, 1) {
+                continue;
             }
-        }
 
-        // Set contract name
-        if trace.contract.is_none() {
-            if let Some(contract) = self.contracts.get(&trace.address) {
-                trace.contract = Some(contract.clone());
-            }
-        }
-
-        let TraceCallData::Raw(cdata) = &trace.data else { return };
-
-        if trace.address == DEFAULT_CREATE2_DEPLOYER {
-            trace!("decoded as create2");
-            trace.data = TraceCallData::Decoded { signature: "create2".to_string(), args: vec![] };
-            return;
-        }
-
-        if cdata.len() >= SELECTOR_LEN {
-            let selector = &cdata[..SELECTOR_LEN];
-            let mut functions = Vec::new();
-            let functions = match self.functions.get(selector) {
-                Some(fs) => fs,
-                None => {
-                    if let Some(identifier) = &self.signature_identifier {
-                        if let Some(function) =
-                            identifier.write().await.identify_function(selector).await
-                        {
-                            functions.push(function);
-                        }
-                    }
-                    &functions
+            // Set label
+            if trace.label.is_none() {
+                if let Some(label) = self.labels.get(&trace.address) {
+                    span.record("label", label);
+                    trace.label = Some(label.clone());
                 }
-            };
-            let [func, ..] = &functions[..] else { return };
-            self.decode_function_input(trace, func);
-            self.decode_function_output(trace, functions);
-        } else {
-            let has_receive = self.receive_contracts.contains(&trace.address);
-            let signature =
-                if cdata.is_empty() && has_receive { "receive()" } else { "fallback()" }.into();
-            let args = if cdata.is_empty() { Vec::new() } else { vec![cdata.to_string()] };
-            trace!(?signature, ?args, "decoded fallback data");
-            trace.data = TraceCallData::Decoded { signature, args };
+            }
 
-            if let TraceRetData::Raw(rdata) = &trace.output {
-                if !trace.success {
-                    let decoded =
-                        decode::decode_revert(rdata, Some(&self.errors), Some(trace.status));
-                    trace!(?decoded, "decoded fallback output");
-                    trace.output = TraceRetData::Decoded(decoded);
+            // Set contract name
+            if trace.contract.is_none() {
+                if let Some(contract) = self.contracts.get(&trace.address) {
+                    trace.contract = Some(contract.clone());
+                }
+            }
+
+            let TraceCallData::Raw(cdata) = &trace.data else { continue };
+
+            if trace.address == DEFAULT_CREATE2_DEPLOYER {
+                trace!("decoded as create2");
+                trace.data =
+                    TraceCallData::Decoded { signature: "create2".to_string(), args: vec![] };
+                continue;
+            }
+
+            if cdata.len() >= SELECTOR_LEN {
+                let selector = Selector::from_slice(&cdata[..SELECTOR_LEN]);
+                selectors.entry(selector).or_default().push(node_idx);
+            } else {
+                let has_receive = self.receive_contracts.contains(&trace.address);
+                let signature =
+                    if cdata.is_empty() && has_receive { "receive()" } else { "fallback()" }.into();
+                let args = if cdata.is_empty() { Vec::new() } else { vec![cdata.to_string()] };
+                trace!(?signature, ?args, "decoded fallback data");
+                trace.data = TraceCallData::Decoded { signature, args };
+
+                if let TraceRetData::Raw(rdata) = &trace.output {
+                    if !trace.success {
+                        let decoded =
+                            decode::decode_revert(rdata, Some(&self.errors), Some(trace.status));
+                        trace!(?decoded, "decoded fallback output");
+                        trace.output = TraceRetData::Decoded(decoded);
+                    }
+                }
+            }
+        }
+
+        // Step 2: identify & process unknown (absent in `self.functions`) function selectors
+        if let Some(identifier) = &self.signature_identifier {
+            let unknown_selectors: Vec<_> = selectors
+                .keys()
+                .filter(|&k| !self.functions.contains_key(k))
+                .map(|s| s.as_slice())
+                .collect();
+
+            let r = identifier.write().await.identify_functions(&unknown_selectors).await;
+
+            for (selector, functions) in unknown_selectors.into_iter().zip(r.into_iter()) {
+                if let Some(func) = functions {
+                    let k = Selector::from_slice(selector);
+                    // Unwrap is always safe: `unknown_selectors` is subset of `selectors`
+                    for node_idx in selectors.get(&k).unwrap() {
+                        let trace = &mut traces.arena[*node_idx].trace;
+                        self.decode_function_input(trace, &func);
+                        self.decode_function_output(trace, &[func.clone()]);
+                    }
+                }
+            }
+        }
+
+        // Step 3: process functions which exists in `self.functions`
+        for (selector, node_indexes) in selectors {
+            if let Some(functions) = self.functions.get(&selector) {
+                let [func, ..] = &functions[..] else { continue };
+                for node_idx in node_indexes {
+                    let trace = &mut traces.arena[node_idx].trace;
+                    self.decode_function_input(trace, func);
+                    self.decode_function_output(trace, functions);
                 }
             }
         }
@@ -467,41 +491,67 @@ impl CallTraceDecoder {
         .map(Into::into)
     }
 
-    /// Decodes an event.
-    async fn decode_event(&self, log: &mut TraceLog) {
-        let TraceLog::Raw(raw_log) = log else { return };
-        let &[t0, ..] = raw_log.topics() else { return };
+    async fn decode_events(&self, traces: &mut CallTraceArena) {
+        let mut unknown_signatures: HashMap<B256, Option<Event>> = HashMap::new();
 
-        let mut events = Vec::new();
-        let events = match self.events.get(&(t0, raw_log.topics().len() - 1)) {
-            Some(es) => es,
-            None => {
-                if let Some(identifier) = &self.signature_identifier {
-                    if let Some(event) = identifier.write().await.identify_event(&t0[..]).await {
-                        events.push(get_indexed_event(event, raw_log));
+        if let Some(identifier) = &self.signature_identifier {
+            for node in traces.arena.iter() {
+                for log in node.logs.iter() {
+                    let TraceLog::Raw(raw_log) = log else { continue };
+                    let &[t0, ..] = raw_log.topics() else { continue };
+                    match self.events.get(&(t0, raw_log.topics().len() - 1)) {
+                        Some(_) => {}
+                        None => {
+                            unknown_signatures.insert(t0, None);
+                        }
+                    };
+                }
+            }
+
+            let events: Vec<_> = unknown_signatures.keys().copied().collect();
+            let x = identifier.write().await.identify_events(&events).await;
+            for (event_sig, res) in events.into_iter().zip(x.into_iter()) {
+                if let Some(v) = res {
+                    unknown_signatures.insert(event_sig, Some(v));
+                }
+            }
+        }
+
+        for node in traces.arena.iter_mut() {
+            for log in node.logs.iter_mut() {
+                let TraceLog::Raw(raw_log) = log else { continue };
+                let &[t0, ..] = raw_log.topics() else { continue };
+
+                let mut events = Vec::new();
+                let events = match self.events.get(&(t0, raw_log.topics().len() - 1)) {
+                    Some(es) => es,
+                    None => {
+                        if let Some(Some(event)) = unknown_signatures.get(&t0) {
+                            events.push(get_indexed_event(event.clone(), raw_log));
+                        }
+                        &events
+                    }
+                };
+                for event in events {
+                    if let Ok(decoded) = event.decode_log(raw_log, false) {
+                        let params = reconstruct_params(event, &decoded);
+                        let name = event.name.clone();
+                        trace!(?name, ?params, "decoded event");
+                        *log = TraceLog::Decoded(
+                            name,
+                            params
+                                .into_iter()
+                                .zip(event.inputs.iter())
+                                .map(|(param, input)| {
+                                    // undo patched names
+                                    let name = input.name.clone();
+                                    (name, self.apply_label(&param))
+                                })
+                                .collect(),
+                        );
+                        break;
                     }
                 }
-                &events
-            }
-        };
-        for event in events {
-            if let Ok(decoded) = event.decode_log(raw_log, false) {
-                let params = reconstruct_params(event, &decoded);
-                let name = event.name.clone();
-                trace!(?name, ?params, "decoded event");
-                *log = TraceLog::Decoded(
-                    name,
-                    params
-                        .into_iter()
-                        .zip(event.inputs.iter())
-                        .map(|(param, input)| {
-                            // undo patched names
-                            let name = input.name.clone();
-                            (name, self.apply_label(&param))
-                        })
-                        .collect(),
-                );
-                break;
             }
         }
     }
